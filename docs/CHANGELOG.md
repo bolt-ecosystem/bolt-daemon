@@ -2,6 +2,30 @@
 
 All notable changes to bolt-daemon. Newest first.
 
+## fix: pairing UI shows the peer HELLO name, never a socket address — 2026-10-24
+
+`pairing.request` under `--pairing-policy ask` was built from the transport
+address. The QUIC answerer passes a synthetic `0.0.0.0:0`, and the WS
+answerer passes the real TCP peer (`192.168.4.25:55170`). `remote_device_type`
+was always the literal `unknown`. HELLO carried no device name, so the Accept
+sheet and the post-accept session label had nothing else to show.
+
+- HELLO inner JSON gains optional `deviceName` and `deviceType`. Both are
+  omitted when this daemon has no usable name, so legacy peers and golden
+  vectors stay valid. A bind address or `ip:port` is never sealed in.
+- This daemon advertises `--device-name`, or the hostname with one trailing
+  `.local` removed. `--device-type` defaults to `desktop`.
+- The answerer reads the peer HELLO before Stage A and puts that name and
+  type on `pairing.request`. `session.connected` carries the same pair.
+  When the peer sent nothing usable, both events use `Unknown device` /
+  `unknown`.
+- CLI: `--device-name`, `--device-type`. Stderr: `[DEVICE] advertising name=`
+  or `[DEVICE] no usable local name`.
+
+An inbound MacBook running this build seals its computer/host name into the
+HELLO it sends the Studio. The Studio Accept sheet shows that name. An older
+MacBook that omits `deviceName` shows as `Unknown device`.
+
 ## docs: retire WebRTC-era operator docs/scripts, rewrite contract for current CLI — 2026-07-21
 
 Public-tree cleanup; no protocol or runtime behavior change.

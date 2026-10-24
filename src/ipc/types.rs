@@ -75,6 +75,20 @@ pub struct DaemonStatusPayload {
 pub struct SessionConnectedPayload {
     pub remote_peer_id: String,
     pub negotiated_capabilities: Vec<String>,
+    /// Human name from the peer HELLO. `"Unknown device"` when none was sent.
+    #[serde(default = "default_unknown_device_name")]
+    pub remote_device_name: String,
+    /// Peer device type from HELLO, or `"unknown"`.
+    #[serde(default = "default_unknown_device_type")]
+    pub remote_device_type: String,
+}
+
+fn default_unknown_device_name() -> String {
+    crate::device_label::UNKNOWN_DEVICE_NAME.to_string()
+}
+
+fn default_unknown_device_type() -> String {
+    "unknown".to_string()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

@@ -29,6 +29,8 @@ longer exist.
 | `--socket-path` | `/tmp/bolt-daemon.sock` | IPC Unix socket path (Windows: named pipe). |
 | `--data-dir` | identity `~/.bolt`, trust `~/.config/bolt-daemon` | Unified data directory. When set: identity at `<dir>/identity.key`, trust at `<dir>/pins/trust.json`, signal files and endpoint metadata in `<dir>`. |
 | `--pairing-policy` | `ask` | `ask`, `allow`, or `deny`. Invalid value → exit 1. |
+| `--device-name` | hostname | Human name sealed into this daemon's HELLO as `deviceName`. A blank, over-long, or address-shaped value is ignored and the hostname is used (one trailing `.local` removed). When neither is usable, HELLO omits `deviceName`. |
+| `--device-type` | `desktop` | Type sealed into HELLO as `deviceType` when a name is advertised. Accepted values: `phone`, `tablet`, `laptop`, `desktop`, `browser`. Anything else stays `desktop`. |
 | `--phase-timeout-secs` | `30` | Per-phase timeout in seconds. Unparseable values are ignored and the default applies (the flag is not validated). |
 
 ### WsEndpoint Mode
@@ -97,6 +99,8 @@ NOT change these without a `docs/CHANGELOG.md` entry.
 | `[bolt-daemon] mode=` | Startup | Banner; mode/pairing/timeout/paths echo |
 | `[bolt-daemon] FATAL:` | Any | Fatal error, exit 1 follows |
 | `[bolt-daemon] parent-death watchdog active` | Sidecar | Watchdog armed against parent PID |
+| `[DEVICE] advertising name=` | Startup | Usable local name will be sealed into HELLO |
+| `[DEVICE] no usable local name` | Startup | HELLO omits `deviceName` |
 | `[IPC] listening on` | Startup | IPC server bound |
 | `[WS_ENDPOINT] starting on` | Startup | WS endpoint about to serve |
 | `[WT_CERT] hash=` | Startup | Ephemeral WT certificate generated |
@@ -145,7 +149,11 @@ The app SHOULD NOT enable transfer UI until `daemon.status` is received.
   feature-gated endpoints. Zero WebRTC at runtime.
 - **Session protection:** NaCl-box encrypted HELLO with capability
   negotiation, Profile Envelope v1 framing post-HELLO, BTR-encrypted
-  transfers when negotiated. Protocol violations fail closed.
+  transfers when negotiated. Protocol violations fail closed. HELLO may
+  include optional `deviceName` and `deviceType`. Legacy HELLOs that omit
+  them still parse. The answerer copies those fields onto `pairing.request`
+  and `session.connected`. A missing or address-shaped name becomes
+  `Unknown device`.
 - **Discovery/signaling** is an app-layer concern. The daemon takes direct
   connect instructions (`connect_remote.signal`) and serves inbound
   connections; it does not talk to a rendezvous server at runtime.

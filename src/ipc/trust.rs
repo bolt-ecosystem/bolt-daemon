@@ -17,6 +17,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::device_label::PeerDisplay;
+
 use super::id::generate_request_id;
 use super::server::ApprovalHandle;
 use super::types::{Decision, IpcMessage, PairingRequestPayload};
@@ -332,6 +334,7 @@ pub async fn check_pairing_approval(
     trust_path: &Path,
     from_peer: &str,
     policy: PairingPolicy,
+    remote_display: &PeerDisplay,
 ) -> Option<Decision> {
     // Note: We no longer check trust store here at Stage A.
     // The trust store is keyed by identity_key_hex which is unknown at this point.
@@ -366,12 +369,19 @@ pub async fn check_pairing_approval(
         }
     };
 
-    // Build pairing request
+    // Build pairing request. `from_peer` is the transport address and is only
+    // for logs. The sheet shows the HELLO device name, or "Unknown device"
+    // when the peer did not send one. A socket or bind address is never a name,
+    // even if a caller passes one in `remote_display`.
     let request_id = generate_request_id();
+    let shown = PeerDisplay::from_hello(
+        Some(remote_display.device_name.as_str()),
+        Some(remote_display.device_type.as_str()),
+    );
     let payload = PairingRequestPayload {
         request_id: request_id.clone(),
-        remote_device_name: from_peer.to_string(),
-        remote_device_type: "unknown".to_string(),
+        remote_device_name: shown.device_name,
+        remote_device_type: shown.device_type,
         remote_identity_pk_b64: String::new(),
         sas: String::new(),
         capabilities_requested: vec!["file_transfer".to_string()],
@@ -408,6 +418,8 @@ pub async fn check_pairing_approval(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device_label::PeerDisplay;
+    use crate::ipc::server::ApprovalHandle;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -562,21 +574,42 @@ mod tests {
     #[tokio::test]
     async fn check_approval_no_ipc_no_trust_returns_none() {
         let path = temp_trust_path();
-        let result = check_pairing_approval(None, &path, "unknown-peer", PairingPolicy::Ask).await;
+        let result = check_pairing_approval(
+            None,
+            &path,
+            "unknown-peer",
+            PairingPolicy::Ask,
+            &PeerDisplay::unknown(),
+        )
+        .await;
         assert!(result.is_none(), "should return None when no IPC server");
     }
 
     #[tokio::test]
     async fn check_approval_policy_deny_returns_none() {
         let path = temp_trust_path();
-        let result = check_pairing_approval(None, &path, "any-peer", PairingPolicy::Deny).await;
+        let result = check_pairing_approval(
+            None,
+            &path,
+            "any-peer",
+            PairingPolicy::Deny,
+            &PeerDisplay::unknown(),
+        )
+        .await;
         assert!(result.is_none(), "policy=deny should return None");
     }
 
     #[tokio::test]
     async fn check_approval_policy_allow_returns_allow_once() {
         let path = temp_trust_path();
-        let result = check_pairing_approval(None, &path, "any-peer", PairingPolicy::Allow).await;
+        let result = check_pairing_approval(
+            None,
+            &path,
+            "any-peer",
+            PairingPolicy::Allow,
+            &PeerDisplay::unknown(),
+        )
+        .await;
         assert_eq!(
             result,
             Some(Decision::AllowOnce),
@@ -816,5 +849,70 @@ mod tests {
         assert_eq!(loaded.get(&hex), Some(Decision::AllowAlways));
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    async fn answer_pairing_request(from_peer: &str, display: &PeerDisplay) -> serde_json::Value {
+        let path = temp_trust_path();
+        let (handle, event_rx) = ApprovalHandle::for_test(true);
+        let display = display.clone();
+        let from_peer = from_peer.to_string();
+        let approval = check_pairing_approval(
+            Some(&handle),
+            &path,
+            &from_peer,
+            PairingPolicy::Ask,
+            &display,
+        );
+        let mut payload = None;
+        let respond = async {
+            for _ in 0..200 {
+                if let Ok(msg) = event_rx.try_recv() {
+                    if msg.msg_type == "pairing.request" {
+                        let request_id = msg.payload["request_id"].as_str().unwrap().to_string();
+                        payload = Some(msg.payload);
+                        for _ in 0..200 {
+                            if handle.test_deliver(&request_id, Decision::AllowOnce) {
+                                return;
+                            }
+                            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                        }
+                        return;
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            }
+        };
+        let (decision, ()) = tokio::join!(approval, respond);
+        assert_eq!(decision, Some(Decision::AllowOnce));
+        payload.expect("pairing.request")
+    }
+
+    #[tokio::test]
+    async fn pairing_request_shows_hello_name_not_socket() {
+        let payload = answer_pairing_request(
+            "0.0.0.0:0",
+            &PeerDisplay::from_hello(Some("Evan's MacBook Pro"), Some("laptop")),
+        )
+        .await;
+        assert_eq!(payload["remote_device_name"], "Evan's MacBook Pro");
+        assert_eq!(payload["remote_device_type"], "laptop");
+        assert_ne!(payload["remote_device_name"], "0.0.0.0:0");
+    }
+
+    #[tokio::test]
+    async fn pairing_request_placeholder_when_only_a_socket_is_known() {
+        let payload = answer_pairing_request(
+            "192.168.4.25:55170",
+            &PeerDisplay {
+                device_name: "192.168.4.25:55170".to_string(),
+                device_type: "unknown".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(payload["remote_device_name"], PeerDisplay::UNKNOWN_NAME);
+        assert_eq!(payload["remote_device_type"], "unknown");
+        let name = payload["remote_device_name"].as_str().unwrap();
+        assert!(!name.contains("192.168.4.25"));
+        assert!(!name.contains("0.0.0.0"));
     }
 }
