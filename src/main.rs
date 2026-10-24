@@ -16,8 +16,8 @@
 // Re-export into the binary crate so existing `crate::` paths still resolve.
 #[allow(unused_imports)]
 pub(crate) use bolt_daemon::{
-    connect_signal, dc_messages, envelope, identity_store, ipc, session, transfer, web_hello,
-    HELLO_PAYLOAD,
+    connect_signal, dc_messages, device_label, envelope, identity_store, ipc, session, transfer,
+    web_hello, HELLO_PAYLOAD,
 };
 
 mod ice_filter;
@@ -63,6 +63,10 @@ pub(crate) struct Args {
     pub(crate) pairing_policy: ipc::trust::PairingPolicy,
     pub(crate) socket_path: Option<String>,
     pub(crate) data_dir: Option<String>,
+    /// Human name sealed into HELLO. Falls back to the hostname when omitted.
+    pub(crate) device_name: Option<String>,
+    /// Device type sealed into HELLO (`phone`, `tablet`, `laptop`, `desktop`, `browser`).
+    pub(crate) device_type: Option<String>,
     /// QUIC listen address (answerer, e.g. "0.0.0.0:4433").
     #[cfg(feature = "transport-quic")]
     pub(crate) quic_listen: Option<String>,
@@ -101,6 +105,8 @@ fn parse_args_from(argv: &[String]) -> Args {
     let mut phase_timeout_secs: Option<u64> = None;
     let mut socket_path = None;
     let mut data_dir = None;
+    let mut device_name = None;
+    let mut device_type = None;
     #[cfg(feature = "transport-ws")]
     let mut ws_listen = None;
     #[cfg(feature = "transport-webtransport")]
@@ -165,6 +171,14 @@ fn parse_args_from(argv: &[String]) -> Args {
                 i += 1;
                 data_dir = argv.get(i).cloned();
             }
+            "--device-name" => {
+                i += 1;
+                device_name = argv.get(i).cloned();
+            }
+            "--device-type" => {
+                i += 1;
+                device_type = argv.get(i).cloned();
+            }
             #[cfg(feature = "transport-ws")]
             "--ws-listen" => {
                 i += 1;
@@ -223,6 +237,8 @@ fn parse_args_from(argv: &[String]) -> Args {
         pairing_policy: pairing_policy.unwrap_or(ipc::trust::PairingPolicy::Ask),
         socket_path,
         data_dir,
+        device_name,
+        device_type,
         #[cfg(feature = "transport-ws")]
         ws_listen,
         #[cfg(feature = "transport-webtransport")]
@@ -437,10 +453,24 @@ fn main() {
                 .as_ref()
                 .map(|dd| ipc::trust::trust_path_from_data_dir(dd))
                 .unwrap_or_else(ipc::trust::default_trust_path);
+            let local_device = device_label::resolve_local_label(
+                args.device_name.as_deref(),
+                args.device_type.as_deref(),
+            );
+            if local_device.name.is_empty() {
+                eprintln!("[DEVICE] no usable local name; HELLO omits deviceName");
+            } else {
+                eprintln!(
+                    "[DEVICE] advertising name={:?} type={}",
+                    local_device.name, local_device.device_type
+                );
+            }
             let session_trust_config = session_loop::SessionTrustConfig {
                 trust_path,
                 pairing_policy: args.pairing_policy,
                 approval,
+                local_device_name: local_device.name,
+                local_device_type: local_device.device_type,
             };
 
             // File send signal: the native shell writes a file path to data_dir/send_file.signal
@@ -851,3 +881,23 @@ fn main() {
 }
 
 // ── Tests ───────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_flags_are_parsed() {
+        let argv = [
+            "bolt-daemon",
+            "--device-name",
+            "Evan's MacBook Pro",
+            "--device-type",
+            "laptop",
+        ]
+        .map(str::to_string);
+        let args = parse_args_from(&argv);
+        assert_eq!(args.device_name.as_deref(), Some("Evan's MacBook Pro"));
+        assert_eq!(args.device_type.as_deref(), Some("laptop"));
+    }
+}

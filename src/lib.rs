@@ -4,6 +4,10 @@
 //! stable public API. This is an application crate, not a reusable library.
 //! Use `test_support` (behind the `test-support` feature) for integration tests.
 
+/// Human device names for pairing and session IPC. Socket addresses are not names.
+#[doc(hidden)]
+pub mod device_label;
+
 #[doc(hidden)]
 pub mod dc_messages;
 #[doc(hidden)]

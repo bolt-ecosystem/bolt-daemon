@@ -22,8 +22,12 @@ use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 use bolt_core::crypto::{generate_ephemeral_keypair, KeyPair};
 use bolt_core::session::SessionContext;
 
+use crate::device_label::PeerDisplay;
+#[cfg(test)]
+use crate::web_hello::build_hello_message;
 use crate::web_hello::{
-    build_hello_message, daemon_capabilities, negotiate_capabilities, parse_hello_typed, HelloError,
+    build_hello_message_with_device, daemon_capabilities, negotiate_capabilities,
+    parse_hello_typed, HelloError,
 };
 // TRANSPORT-UNIFY-1 Phase 2: WT routes through the shared session loop; the
 // envelope/BTR/transfer machinery is inherited from it, not re-owned here.
@@ -282,8 +286,16 @@ async fn handle_incoming_session(
     eprintln!("[WT_HELLO] {peer_addr} negotiated capabilities: {negotiated:?}");
 
     // ── Step 7: Send HELLO response ──────────────────────────
-    let hello_response = build_hello_message(&identity.public_key, &session_kp, &remote_session_pk)
-        .map_err(|e| format!("[WT_HELLO] {peer_addr} failed to build HELLO response: {e}"))?;
+    let local_claim = trust_config
+        .as_ref()
+        .and_then(SessionTrustConfig::device_claim);
+    let hello_response = build_hello_message_with_device(
+        &identity.public_key,
+        &session_kp,
+        &remote_session_pk,
+        local_claim.as_ref(),
+    )
+    .map_err(|e| format!("[WT_HELLO] {peer_addr} failed to build HELLO response: {e}"))?;
     write_frame(&mut send, hello_response.as_bytes()).await?;
     eprintln!("[WT_HELLO] {peer_addr} sent HELLO response");
 
@@ -296,12 +308,17 @@ async fn handle_incoming_session(
     // (item 2); Ask/Deny/Allow per the current policy. A denied peer never reaches
     // run_session_with_outbound / transfer handling. Authorization gating only: not
     // verification, pins nothing.
+    let remote_display = PeerDisplay::from_hello(
+        hello_inner.device_name.as_deref(),
+        hello_inner.device_type.as_deref(),
+    );
     enforce_session_trust(
         trust_config.as_ref(),
         SessionTrustRole::Answerer,
         "WT_SESSION",
         peer_addr,
         &remote_identity_pk,
+        &remote_display,
     )
     .await?;
 
@@ -369,6 +386,8 @@ mod tests {
             )),
             pairing_policy: crate::ipc::trust::PairingPolicy::Allow,
             approval: None,
+            local_device_name: String::new(),
+            local_device_type: String::new(),
         }
     }
 
@@ -385,6 +404,8 @@ mod tests {
                 .join(format!("bolt-wt-test-deny-{}-{n}.json", std::process::id())),
             pairing_policy: crate::ipc::trust::PairingPolicy::Deny,
             approval: None,
+            local_device_name: String::new(),
+            local_device_type: String::new(),
         }
     }
 

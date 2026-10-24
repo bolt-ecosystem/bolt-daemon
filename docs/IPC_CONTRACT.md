@@ -164,7 +164,9 @@ A peer session has been established.
 ```json
 {
   "remote_peer_id": "base64-encoded-identity-public-key",
-  "negotiated_capabilities": ["file_transfer"]
+  "negotiated_capabilities": ["file_transfer"],
+  "remote_device_name": "Evan's MacBook Pro",
+  "remote_device_type": "laptop"
 }
 ```
 
@@ -172,6 +174,10 @@ A peer session has been established.
 |-------|------|-------------|
 | `remote_peer_id` | string | Remote peer's identity public key (base64) |
 | `negotiated_capabilities` | string[] | Capabilities negotiated for this session |
+| `remote_device_name` | string | Human name from the peer HELLO. `"Unknown device"` when the peer omitted `deviceName` or sent a bind/socket address. |
+| `remote_device_type` | string | `phone`, `tablet`, `laptop`, `desktop`, `browser`, or `"unknown"` |
+
+Older consumers that ignore unknown fields keep working. A payload missing these two fields deserializes as `"Unknown device"` / `"unknown"`.
 
 ### `session.sas`
 
@@ -216,8 +222,8 @@ A remote peer is requesting to pair. Consumer must respond with a `pairing.decis
 ```json
 {
   "request_id": "evt-5",
-  "remote_device_name": "iPhone 15",
-  "remote_device_type": "mobile",
+  "remote_device_name": "Evan's MacBook Pro",
+  "remote_device_type": "laptop",
   "remote_identity_pk_b64": "base64-encoded-key",
   "sas": "A1B2C3",
   "capabilities_requested": ["file_transfer"]
@@ -227,10 +233,10 @@ A remote peer is requesting to pair. Consumer must respond with a `pairing.decis
 | Field | Type | Description |
 |-------|------|-------------|
 | `request_id` | string | Correlation ID — MUST be echoed in the decision response |
-| `remote_device_name` | string | Human-readable name of the remote device |
-| `remote_device_type` | string | Device type (e.g., "mobile", "desktop") |
-| `remote_identity_pk_b64` | string | Remote identity public key (base64) |
-| `sas` | string | Short Authentication String for verification |
+| `remote_device_name` | string | Human name from the peer HELLO (`deviceName`). `"Unknown device"` when that field is absent or is a bind address / socket address (`0.0.0.0:0`, `192.168.4.25:55170`). The transport address is never copied here. |
+| `remote_device_type` | string | `phone`, `tablet`, `laptop`, `desktop`, `browser`, or `"unknown"` |
+| `remote_identity_pk_b64` | string | Remote identity public key (base64). Empty when Stage A has not yet filled it. |
+| `sas` | string | Short Authentication String for verification. Empty when Stage A has not yet filled it. |
 | `capabilities_requested` | string[] | Capabilities the remote peer is requesting |
 
 ### `transfer.incoming.request`

@@ -81,6 +81,22 @@ pub struct WebHelloInner {
     #[serde(rename = "identityPublicKey")]
     pub identity_public_key: String,
     pub capabilities: Vec<String>,
+    /// Human-readable name of the sending device. Absent on legacy HELLOs.
+    /// Never a bind address or socket address; those are omitted by the builder
+    /// and ignored by display code.
+    #[serde(
+        default,
+        rename = "deviceName",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub device_name: Option<String>,
+    /// `phone` | `tablet` | `laptop` | `desktop` | `browser`. Absent on legacy HELLOs.
+    #[serde(
+        default,
+        rename = "deviceType",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub device_type: Option<String>,
 }
 
 // ── Key helpers (profile-level, stays in daemon) ────────────
@@ -113,14 +129,37 @@ pub fn build_hello_message(
     session_kp: &KeyPair,
     remote_public_key: &[u8; 32],
 ) -> Result<String, Box<dyn std::error::Error>> {
+    build_hello_message_with_device(identity_pk, session_kp, remote_public_key, None)
+}
+
+/// Build a HELLO that also carries a human device name, when `device` is set.
+///
+/// `None` omits `deviceName` / `deviceType` so legacy peers see the same inner
+/// JSON as before. A claim whose name is a socket or bind address is dropped.
+pub fn build_hello_message_with_device(
+    identity_pk: &[u8; 32],
+    session_kp: &KeyPair,
+    remote_public_key: &[u8; 32],
+    device: Option<&crate::device_label::DeviceClaim>,
+) -> Result<String, Box<dyn std::error::Error>> {
     // Default to base capabilities (no WT). Endpoints that need WT
     // advertisement use daemon_capabilities(true) for negotiation;
     // the HELLO response capabilities are informational.
+    // Re-validate so a socket-shaped claim cannot be sealed into HELLO.
+    let claim = device.and_then(|claim| {
+        crate::device_label::claim_from_local(&claim.device_name, &claim.device_type)
+    });
+    let (device_name, device_type) = match claim {
+        Some(claim) => (Some(claim.device_name), Some(claim.device_type)),
+        None => (None, None),
+    };
     let inner = WebHelloInner {
         msg_type: "hello".to_string(),
         version: 1,
         identity_public_key: to_base64(identity_pk),
         capabilities: daemon_capabilities(false),
+        device_name,
+        device_type,
     };
     let inner_json = serde_json::to_vec(&inner)?;
     let sealed = seal_box_payload(&inner_json, remote_public_key, &session_kp.secret_key)
@@ -262,12 +301,18 @@ mod tests {
             version: 1,
             identity_public_key: "AAAA".to_string(),
             capabilities: vec!["bolt.profile-envelope-v1".to_string()],
+            device_name: None,
+            device_type: None,
         };
         let json = serde_json::to_string(&inner).unwrap();
         assert!(json.contains("\"type\":\"hello\""));
         assert!(json.contains("\"version\":1"));
         assert!(json.contains("\"identityPublicKey\":\"AAAA\""));
         assert!(json.contains("\"capabilities\":[\"bolt.profile-envelope-v1\"]"));
+        assert!(
+            !json.contains("deviceName") && !json.contains("deviceType"),
+            "absent device fields must stay off the wire"
+        );
         let decoded: WebHelloInner = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.version, 1);
         assert_eq!(decoded.identity_public_key, "AAAA");
@@ -299,6 +344,8 @@ mod tests {
             version: 1,
             identity_public_key: to_base64(&kp_a.public_key),
             capabilities: daemon_capabilities(false),
+            device_name: None,
+            device_type: None,
         };
         let plaintext = serde_json::to_vec(&inner).unwrap();
 
@@ -530,6 +577,8 @@ mod tests {
             version: 1,
             identity_public_key: to_base64(&identity.public_key),
             capabilities: caps,
+            device_name: None,
+            device_type: None,
         };
         let plaintext = serde_json::to_vec(&inner).unwrap();
         let sealed =
@@ -558,6 +607,8 @@ mod tests {
             version: 1,
             identity_public_key: to_base64(&identity.public_key),
             capabilities: caps,
+            device_name: None,
+            device_type: None,
         };
         let plaintext = serde_json::to_vec(&inner).unwrap();
         let sealed =
@@ -591,6 +642,8 @@ mod tests {
             version: 1,
             identity_public_key: to_base64(&identity.public_key),
             capabilities: vec![],
+            device_name: None,
+            device_type: None,
         };
         let plaintext = serde_json::to_vec(&inner).unwrap();
         let sealed =
@@ -621,6 +674,8 @@ mod tests {
             version: 1,
             identity_public_key: to_base64(&identity.public_key),
             capabilities: vec![long_cap],
+            device_name: None,
+            device_type: None,
         };
         let plaintext = serde_json::to_vec(&inner).unwrap();
         let sealed =
@@ -655,6 +710,8 @@ mod tests {
             version: 1,
             identity_public_key: to_base64(&identity.public_key),
             capabilities: vec![cap_64.clone()],
+            device_name: None,
+            device_type: None,
         };
         let plaintext = serde_json::to_vec(&inner).unwrap();
         let sealed =
@@ -668,5 +725,53 @@ mod tests {
         let result = parse_hello_typed(msg.as_bytes(), &session_a.public_key, &session_b);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().capabilities, vec![cap_64]);
+    }
+
+    #[test]
+    fn legacy_hello_without_device_fields_still_parses() {
+        let json = r#"{"type":"hello","version":1,"identityPublicKey":"AA","capabilities":[]}"#;
+        let inner: WebHelloInner = serde_json::from_str(json).unwrap();
+        assert!(inner.device_name.is_none());
+        assert!(inner.device_type.is_none());
+    }
+
+    #[test]
+    fn hello_roundtrip_carries_device_name_and_drops_a_socket() {
+        use crate::device_label::DeviceClaim;
+
+        let identity_a = generate_identity_keypair();
+        let session_a = bolt_core::crypto::generate_ephemeral_keypair();
+        let session_b = bolt_core::crypto::generate_ephemeral_keypair();
+        let claim = DeviceClaim {
+            device_name: "Evan's MacBook Pro".to_string(),
+            device_type: "laptop".to_string(),
+        };
+
+        let msg = build_hello_message_with_device(
+            &identity_a.public_key,
+            &session_a,
+            &session_b.public_key,
+            Some(&claim),
+        )
+        .unwrap();
+        let inner = parse_hello_message(msg.as_bytes(), &session_a.public_key, &session_b).unwrap();
+        assert_eq!(inner.device_name.as_deref(), Some("Evan's MacBook Pro"));
+        assert_eq!(inner.device_type.as_deref(), Some("laptop"));
+
+        let socket = DeviceClaim {
+            device_name: "192.168.4.25:55170".to_string(),
+            device_type: "desktop".to_string(),
+        };
+        let bare = build_hello_message_with_device(
+            &identity_a.public_key,
+            &session_a,
+            &session_b.public_key,
+            Some(&socket),
+        )
+        .unwrap();
+        let inner =
+            parse_hello_message(bare.as_bytes(), &session_a.public_key, &session_b).unwrap();
+        assert!(inner.device_name.is_none());
+        assert!(inner.device_type.is_none());
     }
 }

@@ -62,6 +62,7 @@ pub use crate::ws_validation::validate_send_file_path;
 use crate::ws_validation::{parse_transfer_id_bytes, sanitize_filename, MAX_TRANSFER_SIZE};
 
 // BTR crypto extracted to ws_btr (MODULARITY-AUDITABILITY-2).
+use crate::device_label::{session_connected_payload, PeerDisplay};
 use crate::ipc::server::ApprovalHandle;
 use crate::ipc::trust::{
     check_pairing_approval, enforce_stage_b, identity_key_to_hex, PairingPolicy, StageBResult,
@@ -99,6 +100,7 @@ pub(crate) async fn enforce_session_trust(
     transport: &str,
     peer_addr: SocketAddr,
     remote_identity_pk: &[u8; 32],
+    remote_display: &PeerDisplay,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let identity_hex = identity_key_to_hex(remote_identity_pk);
     let Some(config) = trust_config else {
@@ -142,6 +144,7 @@ pub(crate) async fn enforce_session_trust(
                             &config.trust_path,
                             &peer_addr.to_string(),
                             PairingPolicy::Ask,
+                            remote_display,
                         )
                         .await
                         {
@@ -464,8 +467,11 @@ use bolt_core::crypto::{generate_ephemeral_keypair, KeyPair};
 use bolt_core::session::SessionContext;
 
 use crate::envelope::{build_error_payload, decode_envelope_with_btr, route_inner_message};
+#[cfg(test)]
+use crate::web_hello::build_hello_message;
 use crate::web_hello::{
-    build_hello_message, daemon_capabilities, negotiate_capabilities, parse_hello_typed, HelloError,
+    build_hello_message_with_device, daemon_capabilities, negotiate_capabilities,
+    parse_hello_typed, HelloError,
 };
 
 // ── Configuration ────────────────────────────────────────────
@@ -492,6 +498,31 @@ pub struct SessionTrustConfig {
     /// `PairingPolicy::Ask`. `None` in headless and test paths, where `ask` stays
     /// fail-closed: no channel means no approval, which means deny.
     pub approval: Option<ApprovalHandle>,
+    /// Name sealed into this daemon's HELLO. Empty means omit `deviceName`.
+    pub local_device_name: String,
+    /// Type sealed into this daemon's HELLO (`desktop` unless overridden).
+    pub local_device_type: String,
+}
+
+impl SessionTrustConfig {
+    /// Device claim for outbound HELLO, if the configured name is usable.
+    pub(crate) fn device_claim(&self) -> Option<crate::device_label::DeviceClaim> {
+        crate::device_label::claim_from_local(&self.local_device_name, &self.local_device_type)
+    }
+}
+
+fn hello_for_peer(
+    identity_pk: &[u8; 32],
+    session_kp: &KeyPair,
+    remote_session_pk: &[u8; 32],
+    trust_config: Option<&SessionTrustConfig>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let claim = trust_config.and_then(SessionTrustConfig::device_claim);
+    build_hello_message_with_device(identity_pk, session_kp, remote_session_pk, claim.as_ref())
+}
+
+fn peer_display_from_hello(hello: &crate::web_hello::WebHelloInner) -> PeerDisplay {
+    PeerDisplay::from_hello(hello.device_name.as_deref(), hello.device_type.as_deref())
 }
 
 // Manual Debug: ApprovalHandle holds channels that are not usefully printable, so
@@ -503,6 +534,8 @@ impl std::fmt::Debug for SessionTrustConfig {
             .field("trust_path", &self.trust_path)
             .field("pairing_policy", &self.pairing_policy)
             .field("approval", &self.approval.is_some())
+            .field("local_device_name", &self.local_device_name)
+            .field("local_device_type", &self.local_device_type)
             .finish()
     }
 }
@@ -571,8 +604,13 @@ pub async fn connect_to_remote_ws(
     eprintln!("[WS_CLIENT] received remote session-key");
 
     // Step 3: Send HELLO (sealed with remote's session public key)
-    let hello_msg = build_hello_message(&identity.public_key, &session_kp, &remote_session_pk)
-        .map_err(|e| format!("[WS_CLIENT] failed to build HELLO: {e}"))?;
+    let hello_msg = hello_for_peer(
+        &identity.public_key,
+        &session_kp,
+        &remote_session_pk,
+        trust_config.as_ref(),
+    )
+    .map_err(|e| format!("[WS_CLIENT] failed to build HELLO: {e}"))?;
     ws_sink
         .send(Message::Text(hello_msg))
         .await
@@ -588,7 +626,7 @@ pub async fn connect_to_remote_ws(
         .and_then(|v| v.get("legacy")?.as_bool())
         .unwrap_or(false);
 
-    let (negotiated, remote_identity_pk, sas) = if is_legacy {
+    let (negotiated, remote_identity_pk, sas, remote_display) = if is_legacy {
         // ── EA2 fail-closed: reject a legacy (no-identity) HELLO response ────
         // A `legacy: true` response carries no identity key. Accepting it ran the
         // outbound session with a zero identity, an empty SAS, and NO
@@ -616,12 +654,14 @@ pub async fn connect_to_remote_ws(
         let remote_identity_pk =
             crate::web_hello::decode_public_key(&hello_inner.identity_public_key)
                 .map_err(|e| format!("[WS_CLIENT] invalid remote identity key: {e}"))?;
+        let remote_display = peer_display_from_hello(&hello_inner);
         enforce_session_trust(
             trust_config.as_ref(),
             SessionTrustRole::Offerer,
             "WS_CLIENT",
             synthetic_peer_addr,
             &remote_identity_pk,
+            &remote_display,
         )
         .await?;
 
@@ -633,7 +673,7 @@ pub async fn connect_to_remote_ws(
         );
         eprintln!("[SAS] {sas}");
         eprintln!("[WS_CLIENT] HELLO response ok, caps={negotiated:?}");
-        (negotiated, remote_identity_pk, sas)
+        (negotiated, remote_identity_pk, sas, remote_display)
     };
 
     // Build session context
@@ -649,10 +689,7 @@ pub async fn connect_to_remote_ws(
     emit_ipc(
         ipc_tx.as_ref(),
         "session.connected",
-        serde_json::json!({
-            "remote_peer_id": remote_pk_b64_identity,
-            "negotiated_capabilities": negotiated,
-        }),
+        session_connected_payload(&remote_pk_b64_identity, &negotiated, &remote_display),
     );
     if !sas.is_empty() {
         emit_ipc(
@@ -733,8 +770,13 @@ pub async fn connect_to_remote_quic(
         .map_err(|e| format!("[QUIC_CLIENT] invalid remote session key: {e}"))?;
     eprintln!("[QUIC_CLIENT] received remote session-key");
 
-    let hello_msg = build_hello_message(&identity.public_key, &session_kp, &remote_session_pk)
-        .map_err(|e| format!("[QUIC_CLIENT] failed to build HELLO: {e}"))?;
+    let hello_msg = hello_for_peer(
+        &identity.public_key,
+        &session_kp,
+        &remote_session_pk,
+        trust_config.as_ref(),
+    )
+    .map_err(|e| format!("[QUIC_CLIENT] failed to build HELLO: {e}"))?;
     sender
         .send_message(hello_msg.as_bytes())
         .await
@@ -753,12 +795,14 @@ pub async fn connect_to_remote_quic(
     let negotiated = negotiate_capabilities(&local_caps, &hello_inner.capabilities);
     let remote_identity_pk = crate::web_hello::decode_public_key(&hello_inner.identity_public_key)
         .map_err(|e| format!("[QUIC_CLIENT] invalid remote identity key: {e}"))?;
+    let remote_display = peer_display_from_hello(&hello_inner);
     enforce_session_trust(
         trust_config.as_ref(),
         SessionTrustRole::Offerer,
         "QUIC_CLIENT",
         remote,
         &remote_identity_pk,
+        &remote_display,
     )
     .await?;
 
@@ -782,10 +826,7 @@ pub async fn connect_to_remote_quic(
     emit_ipc(
         ipc_tx.as_ref(),
         "session.connected",
-        serde_json::json!({
-            "remote_peer_id": remote_pk_b64_identity,
-            "negotiated_capabilities": negotiated,
-        }),
+        session_connected_payload(&remote_pk_b64_identity, &negotiated, &remote_display),
     );
     emit_ipc(
         ipc_tx.as_ref(),
@@ -874,17 +915,24 @@ pub async fn handle_quic_framed_stream(
 
     let remote_identity_pk = crate::web_hello::decode_public_key(&hello_inner.identity_public_key)
         .map_err(|e| format!("[QUIC_SESSION] {peer_addr} invalid remote identity key: {e}"))?;
+    let remote_display = peer_display_from_hello(&hello_inner);
     enforce_session_trust(
         trust_config.as_ref(),
         SessionTrustRole::Answerer,
         "QUIC_SESSION",
         peer_addr,
         &remote_identity_pk,
+        &remote_display,
     )
     .await?;
 
-    let hello_response = build_hello_message(&identity.public_key, &session_kp, &remote_session_pk)
-        .map_err(|e| format!("[QUIC_HELLO] {peer_addr} failed to build HELLO response: {e}"))?;
+    let hello_response = hello_for_peer(
+        &identity.public_key,
+        &session_kp,
+        &remote_session_pk,
+        trust_config.as_ref(),
+    )
+    .map_err(|e| format!("[QUIC_HELLO] {peer_addr} failed to build HELLO response: {e}"))?;
     sender
         .send_message(hello_response.as_bytes())
         .await
@@ -910,10 +958,7 @@ pub async fn handle_quic_framed_stream(
     emit_ipc(
         ipc_tx,
         "session.connected",
-        serde_json::json!({
-            "remote_peer_id": remote_pk_b64,
-            "negotiated_capabilities": negotiated,
-        }),
+        session_connected_payload(&remote_pk_b64, &negotiated, &remote_display),
     );
     emit_ipc(
         ipc_tx,
@@ -1154,8 +1199,13 @@ async fn handle_connection(
     eprintln!("[WS_HELLO] {peer_addr} negotiated capabilities: {negotiated:?}");
 
     // ── Step 6: Send HELLO response ──────────────────────────
-    let hello_response = build_hello_message(&identity.public_key, &session_kp, &remote_session_pk)
-        .map_err(|e| format!("[WS_HELLO] {peer_addr} failed to build HELLO response: {e}"))?;
+    let hello_response = hello_for_peer(
+        &identity.public_key,
+        &session_kp,
+        &remote_session_pk,
+        trust_config,
+    )
+    .map_err(|e| format!("[WS_HELLO] {peer_addr} failed to build HELLO response: {e}"))?;
     ws_sink
         .send(Message::Text(hello_response))
         .await
@@ -1165,12 +1215,14 @@ async fn handle_connection(
     // ── Step 7: Build session context ────────────────────────
     let remote_identity_pk = crate::web_hello::decode_public_key(&hello_inner.identity_public_key)
         .map_err(|e| format!("[WS_SESSION] {peer_addr} invalid remote identity key: {e}"))?;
+    let remote_display = peer_display_from_hello(&hello_inner);
     enforce_session_trust(
         trust_config,
         SessionTrustRole::Answerer,
         "WS_SESSION",
         peer_addr,
         &remote_identity_pk,
+        &remote_display,
     )
     .await?;
 
@@ -1195,10 +1247,7 @@ async fn handle_connection(
     emit_ipc(
         ipc_tx,
         "session.connected",
-        serde_json::json!({
-            "remote_peer_id": remote_pk_b64,
-            "negotiated_capabilities": negotiated,
-        }),
+        session_connected_payload(&remote_pk_b64, &negotiated, &remote_display),
     );
     emit_ipc(
         ipc_tx,
@@ -1754,6 +1803,7 @@ pub(crate) static SESSION_GLOBALS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device_label::PeerDisplay;
     use crate::envelope::{decode_envelope, encode_envelope};
     use bolt_core::crypto::generate_ephemeral_keypair;
     use bolt_core::identity::generate_identity_keypair;
@@ -1779,6 +1829,8 @@ mod tests {
             )),
             pairing_policy: PairingPolicy::Allow,
             approval: None,
+            local_device_name: String::new(),
+            local_device_type: String::new(),
         }
     }
 
@@ -1826,6 +1878,8 @@ mod tests {
             trust_path: tmp_dir.path().join("trust.json"),
             pairing_policy: PairingPolicy::Ask,
             approval: None,
+            local_device_name: String::new(),
+            local_device_type: String::new(),
         };
         let identity = generate_identity_keypair();
 
@@ -1835,6 +1889,7 @@ mod tests {
             "WS_SESSION",
             "127.0.0.1:1".parse().unwrap(),
             &identity.public_key,
+            &PeerDisplay::unknown(),
         )
         .await;
 
@@ -1853,6 +1908,7 @@ mod tests {
             "WS_SESSION",
             "127.0.0.1:1".parse().unwrap(),
             &identity.public_key,
+            &PeerDisplay::unknown(),
         )
         .await;
         assert!(
@@ -1866,6 +1922,7 @@ mod tests {
             "QUIC_SESSION",
             "127.0.0.1:1".parse().unwrap(),
             &identity.public_key,
+            &PeerDisplay::unknown(),
         )
         .await;
         assert!(offerer.is_err(), "missing trust_config must deny (offerer)");
@@ -1885,6 +1942,8 @@ mod tests {
             trust_path,
             pairing_policy: PairingPolicy::Ask,
             approval: None,
+            local_device_name: String::new(),
+            local_device_type: String::new(),
         };
 
         let result = enforce_session_trust(
@@ -1893,6 +1952,7 @@ mod tests {
             "QUIC_SESSION",
             "127.0.0.1:1".parse().unwrap(),
             &identity.public_key,
+            &PeerDisplay::unknown(),
         )
         .await;
 
@@ -1913,6 +1973,8 @@ mod tests {
             trust_path,
             pairing_policy: PairingPolicy::Allow,
             approval: None,
+            local_device_name: String::new(),
+            local_device_type: String::new(),
         };
 
         let result = enforce_session_trust(
@@ -1921,6 +1983,7 @@ mod tests {
             "QUIC_CLIENT",
             "127.0.0.1:1".parse().unwrap(),
             &identity.public_key,
+            &PeerDisplay::unknown(),
         )
         .await;
 
@@ -1934,26 +1997,31 @@ mod tests {
     // ever wrote a pin. These pin the prompt-and-persist loop end to end.
 
     /// Drive `enforce_session_trust` while answering the emitted `pairing.request`
-    /// with `decision`. Returns the enforcement result and the request_id observed on
-    /// the IPC event channel, so callers can assert the event actually fired.
+    /// with `decision`. Returns the enforcement result, the request_id, and the
+    /// device name on the IPC event.
     async fn ask_with_ui_decision(
         trust: &SessionTrustConfig,
         handle: &ApprovalHandle,
         event_rx: &std::sync::mpsc::Receiver<crate::ipc::types::IpcMessage>,
         identity_pk: &[u8; 32],
         decision: Decision,
+        peer_addr: std::net::SocketAddr,
+        remote_display: &PeerDisplay,
     ) -> (
         Result<String, Box<dyn std::error::Error + Send + Sync>>,
         Option<String>,
+        Option<String>,
     ) {
         let mut observed_request_id = None;
+        let mut observed_device_name = None;
 
         let enforce = enforce_session_trust(
             Some(trust),
             SessionTrustRole::Answerer,
             "WS_SESSION",
-            "127.0.0.1:1".parse().unwrap(),
+            peer_addr,
             identity_pk,
+            remote_display,
         );
 
         // Answer as the UI decision router would. The request is emitted before the
@@ -1964,6 +2032,9 @@ mod tests {
                     if msg.msg_type == "pairing.request" {
                         let request_id = msg.payload["request_id"].as_str().unwrap().to_string();
                         observed_request_id = Some(request_id.clone());
+                        observed_device_name = msg.payload["remote_device_name"]
+                            .as_str()
+                            .map(|name| name.to_string());
                         for _ in 0..200 {
                             if handle.test_deliver(&request_id, decision) {
                                 return;
@@ -1978,7 +2049,7 @@ mod tests {
         };
 
         let (result, ()) = tokio::join!(enforce, respond);
-        (result, observed_request_id)
+        (result, observed_request_id, observed_device_name)
     }
 
     fn ask_trust_config(trust_path: PathBuf, handle: &ApprovalHandle) -> SessionTrustConfig {
@@ -1986,6 +2057,8 @@ mod tests {
             trust_path,
             pairing_policy: PairingPolicy::Ask,
             approval: Some(handle.clone()),
+            local_device_name: String::new(),
+            local_device_type: String::new(),
         }
     }
 
@@ -1999,12 +2072,14 @@ mod tests {
         let (handle, event_rx) = ApprovalHandle::for_test(true);
         let trust = ask_trust_config(trust_path.clone(), &handle);
 
-        let (result, request_id) = ask_with_ui_decision(
+        let (result, request_id, _) = ask_with_ui_decision(
             &trust,
             &handle,
             &event_rx,
             &identity.public_key,
             Decision::AllowAlways,
+            "127.0.0.1:1".parse().unwrap(),
+            &PeerDisplay::unknown(),
         )
         .await;
 
@@ -2030,12 +2105,14 @@ mod tests {
         let (handle, event_rx) = ApprovalHandle::for_test(true);
         let trust = ask_trust_config(trust_path.clone(), &handle);
 
-        let (result, _) = ask_with_ui_decision(
+        let (result, _, _) = ask_with_ui_decision(
             &trust,
             &handle,
             &event_rx,
             &identity.public_key,
             Decision::AllowOnce,
+            "127.0.0.1:1".parse().unwrap(),
+            &PeerDisplay::unknown(),
         )
         .await;
 
@@ -2057,12 +2134,14 @@ mod tests {
         let (handle, event_rx) = ApprovalHandle::for_test(true);
         let trust = ask_trust_config(trust_path.clone(), &handle);
 
-        let (result, _) = ask_with_ui_decision(
+        let (result, _, _) = ask_with_ui_decision(
             &trust,
             &handle,
             &event_rx,
             &identity.public_key,
             Decision::DenyAlways,
+            "127.0.0.1:1".parse().unwrap(),
+            &PeerDisplay::unknown(),
         )
         .await;
 
@@ -2084,12 +2163,14 @@ mod tests {
         let (handle, event_rx) = ApprovalHandle::for_test(true);
         let trust = ask_trust_config(trust_path.clone(), &handle);
 
-        let (result, _) = ask_with_ui_decision(
+        let (result, _, _) = ask_with_ui_decision(
             &trust,
             &handle,
             &event_rx,
             &identity.public_key,
             Decision::DenyOnce,
+            "127.0.0.1:1".parse().unwrap(),
+            &PeerDisplay::unknown(),
         )
         .await;
 
@@ -2117,6 +2198,7 @@ mod tests {
             "WS_SESSION",
             "127.0.0.1:1".parse().unwrap(),
             &identity.public_key,
+            &PeerDisplay::unknown(),
         )
         .await;
 
@@ -2150,6 +2232,7 @@ mod tests {
             "WS_SESSION",
             "127.0.0.1:1".parse().unwrap(),
             &identity.public_key,
+            &PeerDisplay::unknown(),
         )
         .await;
 
@@ -2172,12 +2255,14 @@ mod tests {
         let (handle, event_rx) = ApprovalHandle::for_test(true);
         let trust = ask_trust_config(trust_path, &handle);
 
-        let (_result, request_id) = ask_with_ui_decision(
+        let (_result, request_id, device_name) = ask_with_ui_decision(
             &trust,
             &handle,
             &event_rx,
             &identity.public_key,
             Decision::AllowOnce,
+            "192.168.4.25:55170".parse().unwrap(),
+            &PeerDisplay::unknown(),
         )
         .await;
 
@@ -2185,10 +2270,79 @@ mod tests {
             request_id.is_some(),
             "enforce_session_trust must emit pairing.request under ask with no pin"
         );
+        assert_eq!(
+            device_name.as_deref(),
+            Some(PeerDisplay::UNKNOWN_NAME),
+            "a socket address is not a device name"
+        );
         assert!(
             !request_id.unwrap().is_empty(),
             "pairing.request must carry a request_id"
         );
+    }
+
+    /// Inbound MacBook connect: the accept sheet uses the HELLO name, not the
+    /// synthetic QUIC address `0.0.0.0:0` or the TCP peer socket.
+    #[tokio::test]
+    async fn ask_pairing_request_uses_hello_device_name() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let trust_path = tmp_dir.path().join("trust.json");
+        let identity = generate_identity_keypair();
+        let (handle, event_rx) = ApprovalHandle::for_test(true);
+        let trust = ask_trust_config(trust_path, &handle);
+        let display = PeerDisplay::from_hello(Some("Evan's MacBook Pro"), Some("laptop"));
+
+        let (_result, _request_id, device_name) = ask_with_ui_decision(
+            &trust,
+            &handle,
+            &event_rx,
+            &identity.public_key,
+            Decision::AllowOnce,
+            "0.0.0.0:0".parse().unwrap(),
+            &display,
+        )
+        .await;
+
+        assert_eq!(device_name.as_deref(), Some("Evan's MacBook Pro"));
+    }
+
+    /// The answerer's HELLO response carries this daemon's name so the peer can
+    /// show it. A socket-shaped local name is omitted.
+    #[test]
+    fn hello_for_peer_seals_local_device_name() {
+        let identity = generate_identity_keypair();
+        let session_kp = generate_ephemeral_keypair();
+        let remote = generate_ephemeral_keypair();
+        let trust = SessionTrustConfig {
+            trust_path: std::env::temp_dir().join("bolt-hello-name-trust.json"),
+            pairing_policy: PairingPolicy::Ask,
+            approval: None,
+            local_device_name: "Evan's MacBook Pro".to_string(),
+            local_device_type: "laptop".to_string(),
+        };
+        let msg = hello_for_peer(
+            &identity.public_key,
+            &session_kp,
+            &remote.public_key,
+            Some(&trust),
+        )
+        .unwrap();
+        let inner = parse_hello_typed(msg.as_bytes(), &session_kp.public_key, &remote).unwrap();
+        assert_eq!(inner.device_name.as_deref(), Some("Evan's MacBook Pro"));
+        assert_eq!(inner.device_type.as_deref(), Some("laptop"));
+
+        let mut socket_trust = trust.clone();
+        socket_trust.local_device_name = "0.0.0.0:0".to_string();
+        let bare = hello_for_peer(
+            &identity.public_key,
+            &session_kp,
+            &remote.public_key,
+            Some(&socket_trust),
+        )
+        .unwrap();
+        let inner = parse_hello_typed(bare.as_bytes(), &session_kp.public_key, &remote).unwrap();
+        assert!(inner.device_name.is_none());
+        assert!(inner.device_type.is_none());
     }
 
     /// An existing pin must short-circuit: no prompt, no UI consultation.
@@ -2211,6 +2365,7 @@ mod tests {
             "WS_SESSION",
             "127.0.0.1:1".parse().unwrap(),
             &identity.public_key,
+            &PeerDisplay::unknown(),
         )
         .await;
 
@@ -2236,6 +2391,7 @@ mod tests {
             "WS_CLIENT",
             "127.0.0.1:1".parse().unwrap(),
             &identity.public_key,
+            &PeerDisplay::unknown(),
         )
         .await;
 
@@ -2615,6 +2771,8 @@ mod tests {
             trust_path,
             pairing_policy: PairingPolicy::Allow,
             approval: None,
+            local_device_name: String::new(),
+            local_device_type: String::new(),
         };
 
         let server_handle = tokio::spawn(async move {
